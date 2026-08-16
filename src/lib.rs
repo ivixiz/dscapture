@@ -8,6 +8,7 @@ mod error;
 mod extract;
 mod ffi;
 mod model;
+mod netlist;
 mod parser;
 
 use std::fs;
@@ -17,6 +18,7 @@ use std::path::Path;
 pub use error::{Error, Result};
 pub use extract::{ExtractionBackend, ParseOptions};
 pub use model::{Datasheet, General, ParseMetadata, Pin, Rating};
+pub use netlist::{NetlistOptions, SmokeOptions, to_ngspice_netlist, to_smoke_profile};
 
 /// Parse a PDF file into a typed datasheet model.
 pub fn parse_file(path: impl AsRef<Path>, options: &ParseOptions) -> Result<Datasheet> {
@@ -69,26 +71,45 @@ pub fn write_json_atomic(
     datasheet: &Datasheet,
     pretty: bool,
 ) -> Result<()> {
-    let path = path.as_ref();
+    let json = to_json(datasheet, pretty)?;
+    write_text_atomic(path.as_ref(), &format!("{json}\n"))
+}
+
+/// Generate and atomically write a custom `.smoke` constraint profile.
+pub fn write_smoke_atomic(
+    path: impl AsRef<Path>,
+    datasheet: &Datasheet,
+    options: &SmokeOptions,
+) -> Result<()> {
+    let profile = to_smoke_profile(datasheet, options)?;
+    write_text_atomic(path.as_ref(), &profile)
+}
+
+/// Backward-compatible writer name. The written content is now a custom
+/// `.smoke` profile rather than a standalone NGSpice testbench.
+pub fn write_netlist_atomic(
+    path: impl AsRef<Path>,
+    datasheet: &Datasheet,
+    options: &NetlistOptions,
+) -> Result<()> {
+    write_smoke_atomic(path, datasheet, options)
+}
+
+fn write_text_atomic(path: &Path, contents: &str) -> Result<()> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let json = to_json(datasheet, pretty)?;
     let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(|source| Error::Io {
         path: parent.to_owned(),
         source,
     })?;
     temporary
-        .write_all(json.as_bytes())
+        .write_all(contents.as_bytes())
         .map_err(|source| Error::Io {
             path: path.to_owned(),
             source,
         })?;
-    temporary.write_all(b"\n").map_err(|source| Error::Io {
-        path: path.to_owned(),
-        source,
-    })?;
     temporary.as_file().sync_all().map_err(|source| Error::Io {
         path: path.to_owned(),
         source,

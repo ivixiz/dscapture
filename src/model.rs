@@ -9,6 +9,10 @@ pub struct Datasheet {
     pub pin_configuration: BTreeMap<String, BTreeMap<String, Pin>>,
     pub absolute_maximum_ratings: Vec<Rating>,
     pub recommended_operating_conditions: Vec<Rating>,
+    #[serde(default)]
+    pub electrical_characteristics: Vec<Rating>,
+    #[serde(default)]
+    pub thermal_characteristics: Vec<Rating>,
     pub metadata: ParseMetadata,
 }
 

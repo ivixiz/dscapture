@@ -49,6 +49,8 @@ enum SectionKind {
     Pins,
     AbsoluteMaximum,
     Recommended,
+    Electrical,
+    Thermal,
     Other,
 }
 
@@ -98,6 +100,8 @@ pub(crate) fn parse_document(source: Option<&Path>, extracted: ExtractedDocument
     let pin_configuration = extract_pins(&lines, &packages);
     let absolute_maximum_ratings = extract_ratings(&lines, SectionKind::AbsoluteMaximum);
     let recommended_operating_conditions = extract_ratings(&lines, SectionKind::Recommended);
+    let electrical_characteristics = extract_electrical_characteristics(&lines);
+    let thermal_characteristics = extract_ratings(&lines, SectionKind::Thermal);
 
     let populated_groups = usize::from(name.is_some())
         + usize::from(title.is_some())
@@ -108,14 +112,16 @@ pub(crate) fn parse_document(source: Option<&Path>, extracted: ExtractedDocument
         + usize::from(!packages.is_empty())
         + usize::from(!pin_configuration.is_empty())
         + usize::from(!absolute_maximum_ratings.is_empty())
-        + usize::from(!recommended_operating_conditions.is_empty());
-    let mut confidence = populated_groups as f32 / 10.0;
+        + usize::from(!recommended_operating_conditions.is_empty())
+        + usize::from(!electrical_characteristics.is_empty())
+        + usize::from(!thermal_characteristics.is_empty());
+    let mut confidence = populated_groups as f32 / 12.0;
     if extracted.method.contains("ocr") {
         confidence *= 0.9;
     }
 
     Datasheet {
-        schema_version: "1.0".to_owned(),
+        schema_version: "1.1".to_owned(),
         general: General {
             name,
             title,
@@ -128,6 +134,8 @@ pub(crate) fn parse_document(source: Option<&Path>, extracted: ExtractedDocument
         pin_configuration,
         absolute_maximum_ratings,
         recommended_operating_conditions,
+        electrical_characteristics,
+        thermal_characteristics,
         metadata: ParseMetadata {
             source_file: source_name,
             total_pages: extracted.total_pages,
@@ -744,6 +752,65 @@ fn extract_ratings(lines: &[&str], target: SectionKind) -> Vec<Rating> {
     let Some(heading) = find_best_heading(lines, target) else {
         return Vec::new();
     };
+    extract_ratings_from_heading(lines, target, &heading, false)
+}
+
+fn extract_electrical_characteristics(lines: &[&str]) -> Vec<Rating> {
+    let mut headings = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| !line.contains("....") && !line.contains("……"))
+        .flat_map(|(line_number, line)| {
+            heading_segments(line)
+                .into_iter()
+                .filter(|heading| heading.kind == SectionKind::Electrical)
+                .filter(|heading| {
+                    !char_slice(line, 0, heading.start)
+                        .trim()
+                        .to_ascii_lowercase()
+                        .starts_with("table")
+                })
+                .map(move |heading| Heading {
+                    line: line_number,
+                    ..heading
+                })
+        })
+        .collect::<Vec<_>>();
+    headings.sort_by_key(|heading| heading.line);
+    let heading_lines = headings
+        .iter()
+        .map(|heading| heading.line)
+        .collect::<Vec<_>>();
+    headings = headings
+        .into_iter()
+        .enumerate()
+        .filter(|(index, heading)| {
+            let next_heading = heading_lines.get(index + 1).copied().unwrap_or(lines.len());
+            lines[heading.line + 1..next_heading]
+                .iter()
+                .any(|line| parse_rating_header(line).is_some())
+        })
+        .map(|(_, heading)| heading)
+        .collect();
+
+    let mut rows = Vec::new();
+    for heading in headings {
+        rows.extend(extract_ratings_from_heading(
+            lines,
+            SectionKind::Electrical,
+            &heading,
+            true,
+        ));
+    }
+    deduplicate_ratings(rows)
+}
+
+fn extract_ratings_from_heading(
+    lines: &[&str],
+    target: SectionKind,
+    heading: &Heading,
+    continue_across_pages: bool,
+) -> Vec<Rating> {
     let section_temperature = lines.iter().skip(heading.line).take(4).find_map(|line| {
         TEMPERATURE_RE
             .find(line)
@@ -754,6 +821,7 @@ fn extract_ratings(lines: &[&str], target: SectionKind) -> Vec<Rating> {
     let mut current_parameter: Option<String> = None;
     let mut current_symbol: Option<String> = None;
     let mut current_unit: Option<String> = None;
+    let mut current_unit_parameter: Option<String> = None;
     let mut header_seen = false;
     let end_column = lines
         .iter()
@@ -765,8 +833,9 @@ fn extract_ratings(lines: &[&str], target: SectionKind) -> Vec<Rating> {
         .min()
         .unwrap_or(usize::MAX);
 
-    for line in lines.iter().skip(heading.line + 1).take(420) {
-        if !rows.is_empty() && line.contains('\u{c}') {
+    let scan_limit = if continue_across_pages { 2400 } else { 420 };
+    for line in lines.iter().skip(heading.line + 1).take(scan_limit) {
+        if !continue_across_pages && !rows.is_empty() && line.contains('\u{c}') {
             break;
         }
         let piece = char_slice(line, heading.start.saturating_sub(2), end_column);
@@ -813,8 +882,13 @@ fn extract_ratings(lines: &[&str], target: SectionKind) -> Vec<Rating> {
         if cells.is_empty() {
             continue;
         }
+        let allow_symbolic_values = target != SectionKind::Electrical;
 
-        if cells.len() == 1 && current_parameter.is_some() && is_rating_value(&cells[0]) {
+        if cells.len() == 1
+            && current_parameter.is_some()
+            && is_standalone_rating_value(&cells[0])
+            && is_rating_value_for(&cells[0], allow_symbolic_values)
+        {
             rows.push(Rating {
                 parameter: current_parameter.clone().unwrap_or_default(),
                 symbol: current_symbol.clone(),
@@ -824,13 +898,18 @@ fn extract_ratings(lines: &[&str], target: SectionKind) -> Vec<Rating> {
                 typ: None,
                 max: None,
                 value: Some(cells[0].clone()),
-                unit: current_unit.clone(),
+                unit: if current_unit_parameter.as_deref() == current_parameter.as_deref() {
+                    current_unit.clone()
+                } else {
+                    None
+                },
                 source: clean_text(trimmed),
             });
             continue;
         }
 
-        if let Some(mut rating) = parse_rating_row(&cells, columns, trimmed) {
+        if let Some(mut rating) = parse_rating_row(&cells, columns, trimmed, allow_symbolic_values)
+        {
             if rating.symbol.is_none() && looks_like_symbol(&rating.parameter) {
                 rating.symbol = Some(rating.parameter.clone());
                 if let Some(parameter) = current_parameter.as_ref() {
@@ -867,15 +946,33 @@ fn extract_ratings(lines: &[&str], target: SectionKind) -> Vec<Rating> {
                         .unwrap_or_else(|| "unspecified".to_owned())
                 });
             }
+            if target == SectionKind::Electrical
+                && rating.symbol.is_none()
+                && current_symbol.is_some()
+                && (looks_like_electrical_condition(&rating.source)
+                    || rating
+                        .parameter
+                        .chars()
+                        .next()
+                        .is_some_and(|character| character.is_ascii_digit()))
+            {
+                let row_condition = std::mem::take(&mut rating.parameter);
+                rating.parameter = current_parameter.clone().unwrap_or_default();
+                rating.symbol.clone_from(&current_symbol);
+                rating.conditions = join_conditions(Some(row_condition), rating.conditions.take());
+            }
             if rating.symbol.is_none()
                 && current_parameter.as_deref() == Some(rating.parameter.as_str())
             {
                 rating.symbol.clone_from(&current_symbol);
             }
             if rating.unit.is_none() {
-                rating.unit.clone_from(&current_unit);
+                if current_unit_parameter.as_deref() == Some(rating.parameter.as_str()) {
+                    rating.unit.clone_from(&current_unit);
+                }
             } else {
                 current_unit.clone_from(&rating.unit);
+                current_unit_parameter = Some(rating.parameter.clone());
             }
             if rating.temperature.is_none() {
                 rating.temperature.clone_from(&section_temperature);
@@ -889,25 +986,61 @@ fn extract_ratings(lines: &[&str], target: SectionKind) -> Vec<Rating> {
                 previous.parameter = rating.parameter.clone();
                 previous.unit.clone_from(&rating.unit);
             }
+            if target == SectionKind::Electrical
+                && rating.symbol.is_some()
+                && rating.symbol != current_symbol
+                && let Some(previous) = rows.last_mut()
+                && previous
+                    .source
+                    .chars()
+                    .next()
+                    .is_some_and(|character| character.is_ascii_digit())
+            {
+                previous.parameter = rating.parameter.clone();
+                previous.symbol.clone_from(&rating.symbol);
+                previous.unit.clone_from(&rating.unit);
+            }
             current_parameter = Some(rating.parameter.clone());
             if rating.symbol.is_some() {
                 current_symbol.clone_from(&rating.symbol);
             }
             rows.push(rating);
-        } else if let Some((symbol, parameter)) = parse_rating_group(&cells, columns) {
+        } else if target == SectionKind::Electrical
+            && cells.len() == 1
+            && looks_like_electrical_condition(&cells[0])
+            && cells[0]
+                .chars()
+                .next()
+                .is_some_and(|character| character.is_ascii_digit())
+        {
+            if let Some(previous) = rows.last_mut()
+                && current_parameter.as_deref() == Some(previous.parameter.as_str())
+            {
+                previous.conditions =
+                    join_conditions(previous.conditions.take(), Some(clean_text(&cells[0])));
+                join_sentence(&mut previous.source, &cells[0]);
+            }
+        } else if let Some((symbol, parameter)) =
+            parse_rating_group(&cells, columns, allow_symbolic_values)
+        {
             if let Some(unit) = cells.last().filter(|cell| is_unit(cell)) {
                 current_unit = Some(unit.clone());
+                current_unit_parameter = Some(parameter.clone());
             }
             if let Some(previous) = rows.last_mut()
-                && previous.source.chars().next().is_some_and(|character| {
+                && (previous.source.chars().next().is_some_and(|character| {
                     character.is_ascii_digit() || "+-−–".contains(character)
-                })
+                }) || (target == SectionKind::Electrical
+                    && symbol.is_some()
+                    && looks_like_electrical_condition(&previous.source)))
             {
                 previous.parameter = parameter.clone();
                 if symbol.is_some() {
                     previous.symbol.clone_from(&symbol);
                 }
-                previous.unit.clone_from(&current_unit);
+                if current_unit_parameter.as_deref() == Some(parameter.as_str()) {
+                    previous.unit.clone_from(&current_unit);
+                }
             }
             current_symbol = symbol;
             current_parameter = Some(parameter);
@@ -945,7 +1078,12 @@ fn parse_rating_header(line: &str) -> Option<RatingColumns> {
     })
 }
 
-fn parse_rating_row(cells: &[String], columns: RatingColumns, source: &str) -> Option<Rating> {
+fn parse_rating_row(
+    cells: &[String],
+    columns: RatingColumns,
+    source: &str,
+    allow_symbolic_values: bool,
+) -> Option<Rating> {
     let mut cells = cells.to_vec();
     let unit_index = cells.iter().rposition(|cell| is_unit(cell));
     let (unit, trailing_conditions) = if let Some(index) = unit_index {
@@ -963,7 +1101,9 @@ fn parse_rating_row(cells: &[String], columns: RatingColumns, source: &str) -> O
     };
     let mut values = Vec::new();
     while let Some(last) = cells.last() {
-        if values.len() >= expected_values.max(1) || !is_rating_value(last) {
+        if values.len() >= expected_values.max(1)
+            || !is_rating_value_for(last, allow_symbolic_values)
+        {
             break;
         }
         values.push(cells.pop().expect("last cell exists"));
@@ -973,11 +1113,13 @@ fn parse_rating_row(cells: &[String], columns: RatingColumns, source: &str) -> O
     // Tables with one "Rating" column frequently use a range such as -0.5 to 7.0.
     if values.is_empty()
         && columns.has_value
-        && let Some(index) = cells.iter().rposition(|cell| is_rating_value(cell))
+        && let Some(index) = cells
+            .iter()
+            .rposition(|cell| is_rating_value_for(cell, allow_symbolic_values))
     {
         values.push(cells.remove(index));
     }
-    if values.is_empty() || cells.is_empty() {
+    if values.is_empty() || values.iter().all(|value| is_dash(value)) || cells.is_empty() {
         return None;
     }
 
@@ -1041,14 +1183,14 @@ fn identify_rating_fields(
             None,
         );
     }
-    if columns.symbol_first && cells.len() >= 2 {
+    if columns.symbol_first && cells.len() >= 2 && looks_like_symbol(&cells[0]) {
         return (
             Some(strip_reference(&cells[0])),
             strip_reference(&cells[1]),
             join_optional(&cells[2..]),
         );
     }
-    if columns.parameter_first && cells.len() >= 2 {
+    if columns.parameter_first && cells.len() >= 2 && looks_like_symbol(&cells[1]) {
         return (
             Some(strip_reference(&cells[1])),
             strip_reference(&cells[0]),
@@ -1112,18 +1254,22 @@ fn assign_min_typ_max(rating: &mut Rating, values: &[String], columns: RatingCol
 fn parse_rating_group(
     cells: &[String],
     columns: RatingColumns,
+    allow_symbolic_values: bool,
 ) -> Option<(Option<String>, String)> {
-    let cells = if cells.last().is_some_and(|cell| is_unit(cell)) {
-        &cells[..cells.len() - 1]
-    } else {
-        cells
-    };
+    let mut end = cells.len();
+    if cells.last().is_some_and(|cell| is_unit(cell)) {
+        end -= 1;
+    }
+    while end > 0 && is_dash(&cells[end - 1]) {
+        end -= 1;
+    }
+    let cells = &cells[..end];
     if cells.is_empty() {
         return None;
     }
     if cells
         .iter()
-        .any(|cell| is_rating_value(cell) || is_unit(cell))
+        .any(|cell| is_rating_value_for(cell, allow_symbolic_values) || is_unit(cell))
     {
         return None;
     }
@@ -1131,6 +1277,8 @@ fn parse_rating_group(
         Some((Some(strip_reference(&cells[0])), strip_reference(&cells[1])))
     } else if columns.parameter_first && cells.len() >= 2 && looks_like_symbol(&cells[1]) {
         Some((Some(strip_reference(&cells[1])), strip_reference(&cells[0])))
+    } else if cells.len() >= 2 && looks_like_symbol(&cells[0]) {
+        Some((Some(strip_reference(&cells[0])), strip_reference(&cells[1])))
     } else if cells.len() <= 2 && cells[0].chars().any(char::is_alphabetic) {
         Some((None, strip_reference(&cells[0])))
     } else {
@@ -1140,6 +1288,20 @@ fn parse_rating_group(
 
 fn infer_rating_unit(rating: &mut Rating) {
     let evidence = format!("{} {}", rating.parameter, rating.source).to_ascii_lowercase();
+    let compact_symbol = rating
+        .symbol
+        .as_deref()
+        .unwrap_or_default()
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if evidence.contains("thermal resistance") || compact_symbol.starts_with("rth") {
+        if rating.unit.is_none() || rating.unit.as_deref() == Some("°C") {
+            rating.unit = Some("°C/W".to_owned());
+        }
+        return;
+    }
     if evidence.contains("temperature")
         || evidence.contains("junction")
         || evidence.contains("storage")
@@ -1165,7 +1327,7 @@ fn infer_rating_unit(rating: &mut Rating) {
     });
     rating.unit = if evidence.contains("voltage") || voltage_symbol {
         Some("V".to_owned())
-    } else if evidence.contains("current") {
+    } else if evidence.contains("current") && !evidence.contains("gain") {
         Some("A".to_owned())
     } else {
         None
@@ -1239,7 +1401,10 @@ fn find_best_heading(lines: &[&str], target: SectionKind) -> Option<Heading> {
                         score += 200;
                     }
                 }
-                SectionKind::AbsoluteMaximum | SectionKind::Recommended => {
+                SectionKind::AbsoluteMaximum
+                | SectionKind::Recommended
+                | SectionKind::Electrical
+                | SectionKind::Thermal => {
                     score += usize::from(context.contains("UNIT")) * 80;
                     score += usize::from(context.contains("MAX")) * 40;
                 }
@@ -1336,6 +1501,38 @@ fn classify_heading(value: &str) -> Option<SectionKind> {
             | "operating range"
     ) {
         Some(SectionKind::Recommended)
+    } else if matches!(
+        base,
+        "electrical characteristics"
+            | "electrical characteristic"
+            | "electrical specifications"
+            | "electrical specification"
+            | "dc electrical characteristics"
+            | "dc electrical characteristic"
+            | "ac electrical characteristics"
+            | "ac electrical characteristic"
+            | "dc characteristics"
+            | "ac characteristics"
+            | "static characteristics"
+            | "dynamic characteristics"
+            | "characteristics"
+            | "electrical data"
+    ) || base.starts_with("electrical characteristics ")
+        || base.starts_with("dc characteristics ")
+        || base.starts_with("ac characteristics ")
+    {
+        Some(SectionKind::Electrical)
+    } else if matches!(
+        base,
+        "thermal information"
+            | "thermal characteristics"
+            | "thermal characteristic"
+            | "thermal resistance"
+            | "thermal data"
+    ) {
+        Some(SectionKind::Thermal)
+    } else if base.ends_with("maximum ratings") || base.ends_with("maximum rating") {
+        Some(SectionKind::AbsoluteMaximum)
     } else if is_generic_heading(base) {
         Some(SectionKind::Other)
     } else {
@@ -1346,8 +1543,6 @@ fn classify_heading(value: &str) -> Option<SectionKind> {
 fn is_generic_heading(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
     [
-        "electrical characteristics",
-        "thermal characteristics",
         "ordering information",
         "device information",
         "functional description",
@@ -1479,8 +1674,6 @@ fn is_rating_section_end(value: &str, target: SectionKind) -> bool {
     let lower = LEADING_NUMBER_RE.replace(value, "").to_ascii_lowercase();
     [
         "esd ratings",
-        "thermal information",
-        "thermal characteristics",
         "electrical characteristics",
         "typical characteristics",
         "rating and characteristic curves",
@@ -1570,10 +1763,10 @@ fn looks_like_table_header(value: &str) -> bool {
 
 fn is_footnote(value: &str) -> bool {
     value.starts_with("Note")
-        || Regex::new(r"^\(\d+\)")
+        || Regex::new(r"^\(\d+\)\s+\S")
             .expect("footnote regex")
             .is_match(value)
-        || Regex::new(r"^\[\d+\]")
+        || Regex::new(r"^\[\d+\]\s+\S")
             .expect("footnote regex")
             .is_match(value)
 }
@@ -1651,7 +1844,7 @@ fn is_rating_value(value: &str) -> bool {
     if value.is_empty() || value.len() > 45 {
         return false;
     }
-    if matches!(value, "-" | "—" | "−" | "–") {
+    if matches!(value, "-" | "—" | "−" | "–" | "⎯") {
         return true;
     }
     let lower = value.to_ascii_lowercase();
@@ -1668,20 +1861,79 @@ fn is_rating_value(value: &str) -> bool {
             && value.chars().any(|character| character.is_ascii_digit()))
 }
 
+fn is_rating_value_for(value: &str, allow_symbolic_values: bool) -> bool {
+    if !allow_symbolic_values {
+        let has_letters = value.chars().any(char::is_alphabetic);
+        let starts_with_letter = value.chars().next().is_some_and(char::is_alphabetic);
+        if starts_with_letter
+            || (has_letters && (value.contains('<') || value.contains('>') || value.contains('=')))
+        {
+            return false;
+        }
+    }
+    is_rating_value(value)
+}
+
+fn is_standalone_rating_value(value: &str) -> bool {
+    let value = value.trim();
+    matches!(value, "-" | "—" | "−" | "–" | "⎯")
+        || value.to_ascii_lowercase().contains("internally limited")
+        || value
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_digit() || "+-−–±.<>".contains(character))
+}
+
 fn looks_like_symbol(value: &str) -> bool {
     let value = strip_reference(value);
+    let word_count = value.split_whitespace().count();
+    let compact_symbol = word_count == 1 && value.chars().count() <= 4;
+    let uppercase_symbol = value
+        .chars()
+        .filter(char::is_ascii_alphabetic)
+        .all(|character| character.is_ascii_uppercase());
     value.len() <= 24
-        && value.split_whitespace().count() <= 3
-        && (value.split_whitespace().count() == 1
-            || value
-                .chars()
-                .filter(char::is_ascii_alphabetic)
-                .all(|character| character.is_ascii_uppercase()))
+        && !value.contains(['=', '<', '>'])
+        && !value.contains("°C")
+        && word_count <= 3
+        && (compact_symbol || uppercase_symbol)
         && value.chars().any(char::is_alphabetic)
         && !value.to_ascii_lowercase().contains("voltage")
         && !value.to_ascii_lowercase().contains("current")
         && !value.to_ascii_lowercase().contains("temperature")
         && !value.to_ascii_lowercase().contains("power")
+}
+
+fn looks_like_electrical_condition(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    value.contains(['=', '<', '>'])
+        || TEMPERATURE_RE.is_match(value)
+        || [
+            "source,",
+            "sink,",
+            "turning on",
+            "turning off",
+            "hysteresis",
+            "falling",
+            "rising",
+            "wake up",
+            "no load",
+            "continuous",
+            "auto skip",
+            "delay for",
+            "pg in",
+        ]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
+}
+
+fn join_conditions(first: Option<String>, second: Option<String>) -> Option<String> {
+    let values = [first, second]
+        .into_iter()
+        .flatten()
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    (!values.is_empty()).then(|| values.join("; "))
 }
 
 fn contains_word(haystack: &str, needle: &str) -> bool {
@@ -1691,7 +1943,11 @@ fn contains_word(haystack: &str, needle: &str) -> bool {
 }
 
 fn dash_to_none(value: &str) -> Option<String> {
-    (!matches!(value.trim(), "-" | "—" | "−" | "–" | "⎯")).then(|| value.trim().to_owned())
+    (!is_dash(value)).then(|| value.trim().to_owned())
+}
+
+fn is_dash(value: &str) -> bool {
+    matches!(value.trim(), "-" | "—" | "−" | "–" | "⎯")
 }
 
 fn join_optional(values: &[String]) -> Option<String> {
@@ -1788,7 +2044,7 @@ mod tests {
             .into_iter()
             .map(str::to_owned)
             .collect::<Vec<_>>();
-        let row = parse_rating_row(&cells, header, "R1 bias resistor 70 100 130 kΩ").unwrap();
+        let row = parse_rating_row(&cells, header, "R1 bias resistor 70 100 130 kΩ", true).unwrap();
         assert_eq!(row.symbol.as_deref(), Some("R1"));
         assert_eq!(row.min.as_deref(), Some("70"));
         assert_eq!(row.typ.as_deref(), Some("100"));
@@ -1809,7 +2065,7 @@ mod tests {
             .split("Continuous drain current    ID    -    -    39    A    VGS=4.5 V, TC=25 °C")
             .map(str::to_owned)
             .collect::<Vec<_>>();
-        let row = parse_rating_row(&cells, columns, &cells.join(" ")).unwrap();
+        let row = parse_rating_row(&cells, columns, &cells.join(" "), false).unwrap();
         assert_eq!(row.symbol.as_deref(), Some("ID"));
         assert_eq!(row.max.as_deref(), Some("39"));
         assert_eq!(row.unit.as_deref(), Some("A"));
@@ -1831,5 +2087,49 @@ mod tests {
             Some(SectionKind::Pins)
         );
         assert_eq!(classify_heading("PINOUT"), Some(SectionKind::Pins));
+        assert_eq!(
+            classify_heading("MOSFET MAXIMUM RATINGS (TC = 25°C, unless otherwise noted)"),
+            Some(SectionKind::AbsoluteMaximum)
+        );
+        assert_eq!(
+            classify_heading("THERMAL CHARACTERISTICS"),
+            Some(SectionKind::Thermal)
+        );
+        assert_eq!(
+            classify_heading("ELECTRICAL CHARACTERISTICS (continued)"),
+            Some(SectionKind::Electrical)
+        );
+        assert_eq!(
+            classify_heading("7. Characteristics"),
+            Some(SectionKind::Electrical)
+        );
+    }
+
+    #[test]
+    fn parses_multi_page_electrical_characteristics() {
+        let text = concat!(
+            "ELECTRICAL CHARACTERISTICS\n",
+            "SYMBOL    PARAMETER    TEST CONDITIONS    MIN    TYP    MAX    UNIT\n",
+            "IQ    Quiescent supply current    VIN = 5 V    1    2    3    mA\n",
+            "\u{c}ELECTRICAL CHARACTERISTICS (continued)\n",
+            "SYMBOL    PARAMETER    TEST CONDITIONS    MIN    TYP    MAX    UNIT\n",
+            "VOH    High-level output voltage    IOH = -4 mA    2.4    3.0    3.3    V\n"
+        );
+        let lines = text.lines().collect::<Vec<_>>();
+        let rows = extract_electrical_characteristics(&lines);
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].symbol.as_deref(), Some("IQ"));
+        assert_eq!(rows[0].typ.as_deref(), Some("2"));
+        assert_eq!(rows[1].symbol.as_deref(), Some("VOH"));
+        assert_eq!(rows[1].max.as_deref(), Some("3.3"));
+    }
+
+    #[test]
+    fn standalone_reference_marker_does_not_end_a_rating_table() {
+        assert!(!is_footnote("(4)"));
+        assert!(is_footnote(
+            "(4) Stresses beyond those listed may cause damage."
+        ));
     }
 }

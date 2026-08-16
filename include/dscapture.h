@@ -24,6 +24,31 @@ char *dscapture_parse_bytes_json(const uint8_t *data,
                                  const char *filename_hint,
                                  const char *options_json);
 
+/*
+ * Parse a PDF and return a custom dscapture .smoke constraint profile. Both option
+ * strings may be NULL. Free the returned string with dscapture_free_string().
+ */
+char *dscapture_parse_file_smoke(const char *input_path,
+                                 const char *parse_options_json,
+                                 const char *smoke_options_json);
+
+char *dscapture_parse_bytes_smoke(const uint8_t *data,
+                                  size_t length,
+                                  const char *filename_hint,
+                                  const char *parse_options_json,
+                                  const char *smoke_options_json);
+
+/* Compatibility aliases; these now also return the custom .smoke profile. */
+char *dscapture_parse_file_ngspice(const char *input_path,
+                                   const char *parse_options_json,
+                                   const char *smoke_options_json);
+
+char *dscapture_parse_bytes_ngspice(const uint8_t *data,
+                                    size_t length,
+                                    const char *filename_hint,
+                                    const char *parse_options_json,
+                                    const char *smoke_options_json);
+
 void dscapture_free_string(char *value);
 
 #ifdef __cplusplus

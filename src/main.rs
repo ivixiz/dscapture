@@ -1,7 +1,10 @@
 use std::path::PathBuf;
 
 use clap::{Parser, ValueEnum};
-use dscapture::{ExtractionBackend, ParseOptions, parse_file, write_json_atomic};
+use dscapture::{
+    ExtractionBackend, ParseOptions, SmokeOptions, parse_file, to_smoke_profile, write_json_atomic,
+    write_smoke_atomic,
+};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum BackendArg {
@@ -25,7 +28,7 @@ impl From<BackendArg> for ExtractionBackend {
 #[derive(Debug, Parser)]
 #[command(
     version,
-    about = "Parse an electronic-component PDF datasheet into JSON"
+    about = "Parse an electronic-component PDF datasheet into JSON and a custom smoke profile"
 )]
 struct Cli {
     /// Source PDF. Defaults to input.pdf.
@@ -63,6 +66,26 @@ struct Cli {
     /// Write compact rather than pretty-printed JSON.
     #[arg(long)]
     compact: bool,
+
+    /// Custom smoke-profile path. Defaults to the JSON path with a .cir extension.
+    #[arg(long, visible_alias = "netlist-output")]
+    smoke_output: Option<PathBuf>,
+
+    /// Do not generate the custom smoke profile.
+    #[arg(long, visible_alias = "no-netlist")]
+    no_smoke: bool,
+
+    /// Override the device name following the .smoke directive.
+    #[arg(long)]
+    smoke_device: Option<String>,
+
+    /// Project derating factor written to the profile.
+    #[arg(long, default_value_t = 0.8)]
+    derate: f64,
+
+    /// Default TC_REF for current and power ratings when the table omits it.
+    #[arg(long, default_value_t = 25.0)]
+    reference_temperature: f64,
 }
 
 fn run() -> dscapture::Result<()> {
@@ -79,16 +102,41 @@ fn run() -> dscapture::Result<()> {
     };
 
     let datasheet = parse_file(&cli.input, &options)?;
+    let smoke_options = SmokeOptions {
+        device_name: cli.smoke_device,
+        derate: cli.derate,
+        reference_temperature_c: cli.reference_temperature,
+    };
+    let smoke_path = cli
+        .smoke_output
+        .unwrap_or_else(|| cli.output.with_extension("cir"));
+    if !cli.no_smoke {
+        if smoke_path == cli.output {
+            return Err(dscapture::Error::InvalidOptions(
+                "JSON and smoke-profile output paths must be different".to_owned(),
+            ));
+        }
+        // Validate smoke-profile settings before writing either output.
+        let _ = to_smoke_profile(&datasheet, &smoke_options)?;
+    }
     write_json_atomic(&cli.output, &datasheet, options.pretty_json)?;
+    if !cli.no_smoke {
+        write_smoke_atomic(&smoke_path, &datasheet, &smoke_options)?;
+    }
 
     eprintln!(
-        "parsed {} page(s): {} pin package(s), {} absolute and {} recommended rating row(s) -> {}",
+        "parsed {} page(s): {} pin package(s), {} absolute, {} recommended, {} electrical, and {} thermal row(s) -> {}",
         datasheet.metadata.pages_processed,
         datasheet.pin_configuration.len(),
         datasheet.absolute_maximum_ratings.len(),
         datasheet.recommended_operating_conditions.len(),
+        datasheet.electrical_characteristics.len(),
+        datasheet.thermal_characteristics.len(),
         cli.output.display()
     );
+    if !cli.no_smoke {
+        eprintln!("custom smoke profile -> {}", smoke_path.display());
+    }
     for warning in &datasheet.metadata.warnings {
         eprintln!("warning: {warning}");
     }

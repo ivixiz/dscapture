@@ -4,7 +4,7 @@ use std::slice;
 
 use serde_json::json;
 
-use crate::{ParseOptions, parse_bytes, parse_file, to_json};
+use crate::{ParseOptions, SmokeOptions, parse_bytes, parse_file, to_json, to_smoke_profile};
 
 const VERSION: &[u8] = b"0.1.0\0";
 
@@ -75,6 +75,96 @@ pub extern "C" fn dscapture_parse_bytes_json(
     })
 }
 
+/// Parse a PDF file and return a custom dscapture `.smoke` profile.
+///
+/// Both option strings may be NULL. Release the returned pointer with
+/// `dscapture_free_string`.
+#[unsafe(no_mangle)]
+pub extern "C" fn dscapture_parse_file_smoke(
+    input_path: *const c_char,
+    parse_options_json: *const c_char,
+    smoke_options_json: *const c_char,
+) -> *mut c_char {
+    ffi_json(|| {
+        if input_path.is_null() {
+            return Err("input_path is NULL".to_owned());
+        }
+        // SAFETY: The C API requires a readable NUL-terminated input string.
+        let path = unsafe { CStr::from_ptr(input_path) }
+            .to_str()
+            .map_err(|error| format!("input_path is not UTF-8: {error}"))?;
+        let parse_options = ffi_options(parse_options_json)?;
+        let smoke_options = ffi_smoke_options(smoke_options_json)?;
+        let result = parse_file(path, &parse_options).map_err(|error| error.to_string())?;
+        to_smoke_profile(&result, &smoke_options).map_err(|error| error.to_string())
+    })
+}
+
+/// Parse PDF bytes and return a custom dscapture `.smoke` profile.
+#[unsafe(no_mangle)]
+pub extern "C" fn dscapture_parse_bytes_smoke(
+    data: *const u8,
+    length: usize,
+    filename_hint: *const c_char,
+    parse_options_json: *const c_char,
+    smoke_options_json: *const c_char,
+) -> *mut c_char {
+    ffi_json(|| {
+        if data.is_null() && length != 0 {
+            return Err("data is NULL while length is non-zero".to_owned());
+        }
+        // SAFETY: The C API requires `data` to point to at least `length` bytes.
+        let bytes = if length == 0 {
+            &[]
+        } else {
+            unsafe { slice::from_raw_parts(data, length) }
+        };
+        let hint = if filename_hint.is_null() {
+            None
+        } else {
+            // SAFETY: The C API requires a readable NUL-terminated hint string.
+            Some(
+                unsafe { CStr::from_ptr(filename_hint) }
+                    .to_str()
+                    .map_err(|error| format!("filename_hint is not UTF-8: {error}"))?,
+            )
+        };
+        let parse_options = ffi_options(parse_options_json)?;
+        let smoke_options = ffi_smoke_options(smoke_options_json)?;
+        let result = parse_bytes(bytes, hint, &parse_options).map_err(|error| error.to_string())?;
+        to_smoke_profile(&result, &smoke_options).map_err(|error| error.to_string())
+    })
+}
+
+/// Compatibility alias. The returned content is the custom `.smoke` profile,
+/// not a standalone NGSpice testbench.
+#[unsafe(no_mangle)]
+pub extern "C" fn dscapture_parse_file_ngspice(
+    input_path: *const c_char,
+    parse_options_json: *const c_char,
+    netlist_options_json: *const c_char,
+) -> *mut c_char {
+    dscapture_parse_file_smoke(input_path, parse_options_json, netlist_options_json)
+}
+
+/// Compatibility alias for `dscapture_parse_bytes_smoke`.
+#[unsafe(no_mangle)]
+pub extern "C" fn dscapture_parse_bytes_ngspice(
+    data: *const u8,
+    length: usize,
+    filename_hint: *const c_char,
+    parse_options_json: *const c_char,
+    netlist_options_json: *const c_char,
+) -> *mut c_char {
+    dscapture_parse_bytes_smoke(
+        data,
+        length,
+        filename_hint,
+        parse_options_json,
+        netlist_options_json,
+    )
+}
+
 /// Free a string returned by a dscapture C ABI function.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn dscapture_free_string(value: *mut c_char) {
@@ -93,6 +183,17 @@ fn ffi_options(options_json: *const c_char) -> std::result::Result<ParseOptions,
         .to_str()
         .map_err(|error| format!("options_json is not UTF-8: {error}"))?;
     serde_json::from_str(options).map_err(|error| format!("invalid options JSON: {error}"))
+}
+
+fn ffi_smoke_options(options_json: *const c_char) -> std::result::Result<SmokeOptions, String> {
+    if options_json.is_null() {
+        return Ok(SmokeOptions::default());
+    }
+    // SAFETY: The C API requires a readable NUL-terminated options string.
+    let options = unsafe { CStr::from_ptr(options_json) }
+        .to_str()
+        .map_err(|error| format!("smoke_options_json is not UTF-8: {error}"))?;
+    serde_json::from_str(options).map_err(|error| format!("invalid smoke options JSON: {error}"))
 }
 
 fn ffi_json(operation: impl FnOnce() -> std::result::Result<String, String>) -> *mut c_char {

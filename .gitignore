@@ -1,4 +1,5 @@
 /target/
 /output.json
+/output.cir
 *.tmp
 /sources/
